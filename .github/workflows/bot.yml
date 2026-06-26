@@ -1,0 +1,46 @@
+name: Grain Trading Bot
+
+on:
+  schedule:
+    - cron: '0 0 * * 1-5'
+    - cron: '0 1 * * 1-5'
+    - cron: '0 2-8 * * 2-6'
+    - cron: '30 19 * * 5'
+    - cron: '0 20 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'Modo de ejecución'
+        required: true
+        default: 'todo'
+        type: choice
+        options:
+          - señales
+          - seguimiento
+          - resumen
+          - todo
+
+jobs:
+  run-bot:
+    name: Ejecutar bot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar bot
+        env:
+          SUPABASE_URL:     ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:     ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python src/bot.py --modo ${{ github.event.inputs.modo || 'todo' }}
