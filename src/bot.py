@@ -3,7 +3,7 @@ bot.py — Script principal del bot de paper trading
 Se ejecuta automáticamente via GitHub Actions según el horario configurado
 
 Modos:
-  python bot.py --modo señales    → busca señales nuevas
+  python bot.py --modo señales     → busca señales nuevas
   python bot.py --modo seguimiento → actualiza trades abiertos
   python bot.py --modo resumen     → envía resumen diario
   python bot.py --modo todo        → ejecuta los tres pasos
@@ -12,25 +12,23 @@ Modos:
 import argparse
 import logging
 import sys
+import time
 from datetime import datetime
 import pytz
 
-# Importar módulos propios
 from config import ESTRATEGIAS, E1, E2, E3, RIESGO, TZ_CHICAGO, TZ_LOCAL
 from data import descargar_datos, convertir_zona_horaria, obtener_adr, cerca_de_rollover
 from indicators import calcular_indicadores, señal_e1, señal_e2_e3, calcular_size
 from database import (save_signal, open_trade, update_trade,
-                       close_trade, get_open_trades, get_summary)
+                       close_trade, get_open_trades, get_summary,
+                       save_cycle_log)
 from alerts import (alert_signal, alert_close, alert_rollover,
                     alert_daily_summary, alert_error)
 
-# ── Logging ──
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
@@ -40,200 +38,270 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════
 
 def buscar_señales():
-    """
-    Evalúa las 3 estrategias y registra señales si las hay.
-    """
     logger.info("=" * 50)
     logger.info("BUSCANDO SEÑALES...")
     logger.info("=" * 50)
 
-    ahora_chicago = datetime.now(pytz.timezone(TZ_CHICAGO))
-    mes_actual = ahora_chicago.month
-
-    señales_encontradas = 0
+    ahora_chicago  = datetime.now(pytz.timezone(TZ_CHICAGO))
+    mes_actual     = ahora_chicago.month
+    señales_n      = 0
+    strategy_logs  = []   # observabilidad por ciclo
+    errors         = []
 
     # ── E1: Maíz SHORT nocturno ──
     logger.info(f"[E1] Evaluando {E1['nombre']}...")
+    sl_e1 = {
+        'strategy': 'E1', 'ticker': E1['ticker'],
+        'signal': False, 'reason': 'sin_señal',
+        'close': None, 'bb_up': None, 'bb_mid': None,
+        'adx': None, 'adx_min': E1['adx_min'],
+        'seasonal_factor': None, 'size': None,
+        'adr_ratio': None, 'hora': None,
+        'horas_op': E1.get('horas_op'),
+    }
     try:
         df_1h = descargar_datos(E1['ticker'], E1['periodo_data'], E1['intervalo'])
-        if not df_1h.empty:
-            df_1h = convertir_zona_horaria(df_1h, TZ_CHICAGO)
-            df_1h = calcular_indicadores(df_1h)
-            adr   = obtener_adr(E1['ticker'])
+        if df_1h.empty:
+            sl_e1['reason'] = 'datos_vacios'
+        else:
+            df_1h  = convertir_zona_horaria(df_1h, TZ_CHICAGO)
+            df_1h  = calcular_indicadores(df_1h)
+            adr    = obtener_adr(E1['ticker'])
+            ultima = df_1h.iloc[-1]
+            close  = float(ultima['Close'])
+            bb_up  = float(ultima['bb_up'])
+            bb_mid = float(ultima['bb_mid'])
+            adx    = float(ultima['adx'])
+            hora   = df_1h.index[-1].hour
+            factor = E1['sizing_estacional'].get(mes_actual, 1.0)
+
+            sl_e1.update({
+                'close': round(close, 3), 'bb_up': round(bb_up, 3),
+                'bb_mid': round(bb_mid, 3), 'adx': round(adx, 2),
+                'seasonal_factor': factor, 'adr_ratio': round(adr['ratio'], 3),
+                'hora': hora,
+            })
+
+            # Diagnóstico detallado del motivo de no-señal
+            if factor == 0:
+                sl_e1['reason'] = 'factor_estacional_cero'
+            elif adx <= E1['adx_min']:
+                sl_e1['reason'] = f"adx_bajo ({adx:.1f} <= {E1['adx_min']})"
+            elif close < bb_up:
+                sl_e1['reason'] = f"precio_fuera_bb (close={close:.3f} < bb_up={bb_up:.3f})"
+            elif hora not in E1.get('horas_op', []):
+                sl_e1['reason'] = f"hora_fuera_rango (hora={hora} no en {E1.get('horas_op')})"
+            elif (close - bb_mid) < E1.get('rec_min', 0):
+                sl_e1['reason'] = f"recorrido_insuficiente ({close-bb_mid:.3f} < {E1.get('rec_min')})"
 
             if señal_e1(df_1h, E1):
-                ultima = df_1h.iloc[-1]
-                factor = E1['sizing_estacional'].get(mes_actual, 1.0)
-                size   = calcular_size(adr['ratio'], factor)
-
+                size = calcular_size(adr['ratio'], factor)
+                sl_e1['size'] = size
                 if size > 0:
-                    sl_precio = round(float(ultima['Close']) + E1['sl_cts'], 3)
-                    rec       = round(float(ultima['Close']) - float(ultima['bb_mid']), 3)
-
+                    sl_e1['signal'] = True
+                    sl_e1['reason'] = 'señal_detectada'
+                    sl_precio = round(close + E1['sl_cts'], 3)
+                    rec       = round(close - bb_mid, 3)
                     señal = save_signal(
-                        estrategia='E1', ticker=E1['ticker'],
-                        direccion='SHORT',
-                        precio_entrada=float(ultima['Close']),
-                        bb_up=float(ultima['bb_up']),
-                        bb_mid=float(ultima['bb_mid']),
-                        adx=float(ultima['adx']),
-                        recorrido=rec,
-                        size=size,
-                        factor_estacional=factor,
-                        ratio_adr=adr['ratio'],
-                        sl=sl_precio,
+                        strategy='E1', ticker=E1['ticker'], direction='SHORT',
+                        entry_price=close, bb_up=bb_up, bb_mid=bb_mid,
+                        adx=adx, range_cts=rec, size=size,
+                        seasonal_factor=factor, adr_ratio=adr['ratio'],
+                        sl_price=sl_precio,
                     )
-
                     if señal:
                         open_trade(
-                            señal_id=str(señal.get('id', 'paper')),
-                            estrategia='E1', ticker=E1['ticker'],
-                            direccion='SHORT',
-                            entrada=float(ultima['Close']),
-                            sl=sl_precio,
-                            trail_cts=E1['sl_cts'],
-                            size=size,
+                            signal_id=str(señal.get('id', 'paper')),
+                            strategy='E1', ticker=E1['ticker'], direction='SHORT',
+                            entry=close, sl=sl_precio,
+                            trail_cts=E1['sl_cts'], size=size,
                         )
-
                     alert_signal(
-                        estrategia=E1['nombre'],
-                        ticker=E1['ticker'], direccion='SHORT',
-                        precio=float(ultima['Close']), sl=sl_precio,
-                        size=size, adx=float(ultima['adx']),
-                        recorrido=rec, factor_estacional=factor,
+                        estrategia=E1['nombre'], ticker=E1['ticker'],
+                        direccion='SHORT', precio=close, sl=sl_precio,
+                        size=size, adx=adx, recorrido=rec,
+                        factor_estacional=factor,
                     )
-                    señales_encontradas += 1
-                    logger.info(f"[E1] ✓ Señal SHORT detectada @ {ultima['Close']:.2f}")
+                    señales_n += 1
+                    logger.info(f"[E1] ✓ Señal SHORT detectada @ {close:.2f}")
                 else:
-                    logger.info(f"[E1] Señal detectada pero factor estacional=0 (mes {mes_actual}) → omitida")
+                    sl_e1['reason'] = 'factor_estacional_cero'
+                    logger.info(f"[E1] Señal detectada pero factor=0 (mes {mes_actual}) → omitida")
             else:
-                logger.info("[E1] Sin señal")
+                logger.info(f"[E1] Sin señal | motivo: {sl_e1['reason']}")
+
     except Exception as e:
+        sl_e1['reason'] = f"error: {e}"
+        errors.append(f"E1: {e}")
         logger.error(f"[E1] Error: {e}")
         alert_error(f"E1 error en señales: {e}")
 
+    strategy_logs.append(sl_e1)
+
     # ── E2: Maíz LONG semanal ──
     logger.info(f"[E2] Evaluando {E2['nombre']}...")
+    sl_e2 = {
+        'strategy': 'E2', 'ticker': E2['ticker'],
+        'signal': False, 'reason': 'sin_señal',
+        'close': None, 'bb_up': None, 'bb_mid': None,
+        'adx': None, 'adx_min': E2['adx_min'],
+        'seasonal_factor': None, 'size': None, 'adr_ratio': None,
+    }
     try:
         df_1w = descargar_datos(E2['ticker'], E2['periodo_data'], E2['intervalo'])
-        if not df_1w.empty:
-            df_1w = calcular_indicadores(df_1w)
-            adr   = obtener_adr(E2['ticker'])
+        if df_1w.empty:
+            sl_e2['reason'] = 'datos_vacios'
+        else:
+            df_1w  = calcular_indicadores(df_1w)
+            adr    = obtener_adr(E2['ticker'])
+            ultima = df_1w.iloc[-1]
+            close  = float(ultima['Close'])
+            bb_up  = float(ultima['bb_up'])
+            bb_mid = float(ultima['bb_mid'])
+            adx    = float(ultima['adx'])
+            factor = E2['sizing_estacional'].get(mes_actual, 1.0)
+
+            sl_e2.update({
+                'close': round(close, 3), 'bb_up': round(bb_up, 3),
+                'bb_mid': round(bb_mid, 3), 'adx': round(adx, 2),
+                'seasonal_factor': factor, 'adr_ratio': round(adr['ratio'], 3),
+            })
+
+            if factor == 0:
+                sl_e2['reason'] = 'factor_estacional_cero'
+            elif adx <= E2['adx_min']:
+                sl_e2['reason'] = f"adx_bajo ({adx:.1f} <= {E2['adx_min']})"
+            elif close <= bb_up:
+                sl_e2['reason'] = f"precio_fuera_bb (close={close:.3f} <= bb_up={bb_up:.3f})"
 
             if señal_e2_e3(df_1w, E2):
-                ultima = df_1w.iloc[-1]
-                factor = E2['sizing_estacional'].get(mes_actual, 1.0)
-                size   = calcular_size(adr['ratio'], factor)
-
+                size = calcular_size(adr['ratio'], factor)
+                sl_e2['size'] = size
                 if size > 0:
+                    sl_e2['signal'] = True
+                    sl_e2['reason'] = 'señal_detectada'
                     trail_cts = round(float(ultima['atr14']) * E2['trail_atr'], 2)
-                    sl_precio = round(float(ultima['Close']) - trail_cts, 3)
-
+                    sl_precio = round(close - trail_cts, 3)
+                    rec       = round(close - bb_mid, 2)
                     señal = save_signal(
-                        estrategia='E2', ticker=E2['ticker'],
-                        direccion='LONG',
-                        precio_entrada=float(ultima['Close']),
-                        bb_up=float(ultima['bb_up']),
-                        bb_mid=float(ultima['bb_mid']),
-                        adx=float(ultima['adx']),
-                        recorrido=round(float(ultima['Close']) - float(ultima['bb_mid']), 2),
-                        size=size,
-                        factor_estacional=factor,
-                        ratio_adr=adr['ratio'],
-                        sl=sl_precio,
+                        strategy='E2', ticker=E2['ticker'], direction='LONG',
+                        entry_price=close, bb_up=bb_up, bb_mid=bb_mid,
+                        adx=adx, range_cts=rec, size=size,
+                        seasonal_factor=factor, adr_ratio=adr['ratio'],
+                        sl_price=sl_precio,
                     )
-
                     if señal:
                         open_trade(
-                            señal_id=str(señal.get('id', 'paper')),
-                            estrategia='E2', ticker=E2['ticker'],
-                            direccion='LONG',
-                            entrada=float(ultima['Close']),
-                            sl=sl_precio,
-                            trail_cts=trail_cts,
-                            size=size,
+                            signal_id=str(señal.get('id', 'paper')),
+                            strategy='E2', ticker=E2['ticker'], direction='LONG',
+                            entry=close, sl=sl_precio,
+                            trail_cts=trail_cts, size=size,
                         )
-
                     alert_signal(
-                        estrategia=E2['nombre'],
-                        ticker=E2['ticker'], direccion='LONG',
-                        precio=float(ultima['Close']), sl=sl_precio,
-                        size=size, adx=float(ultima['adx']),
-                        recorrido=round(float(ultima['Close']) - float(ultima['bb_mid']), 2),
+                        estrategia=E2['nombre'], ticker=E2['ticker'],
+                        direccion='LONG', precio=close, sl=sl_precio,
+                        size=size, adx=adx, recorrido=rec,
                         factor_estacional=factor,
                     )
-                    señales_encontradas += 1
-                    logger.info(f"[E2] ✓ Señal LONG detectada @ {ultima['Close']:.2f}")
+                    señales_n += 1
+                    logger.info(f"[E2] ✓ Señal LONG detectada @ {close:.2f}")
                 else:
-                    logger.info(f"[E2] Factor estacional=0 (mes {mes_actual}) → omitida")
+                    sl_e2['reason'] = 'factor_estacional_cero'
+                    logger.info(f"[E2] Factor=0 (mes {mes_actual}) → omitida")
             else:
-                logger.info("[E2] Sin señal")
+                logger.info(f"[E2] Sin señal | motivo: {sl_e2['reason']}")
+
     except Exception as e:
+        sl_e2['reason'] = f"error: {e}"
+        errors.append(f"E2: {e}")
         logger.error(f"[E2] Error: {e}")
         alert_error(f"E2 error en señales: {e}")
 
+    strategy_logs.append(sl_e2)
+
     # ── E3: Soja LONG semanal ──
     logger.info(f"[E3] Evaluando {E3['nombre']}...")
+    sl_e3 = {
+        'strategy': 'E3', 'ticker': E3['ticker'],
+        'signal': False, 'reason': 'sin_señal',
+        'close': None, 'bb_up': None, 'bb_mid': None,
+        'adx': None, 'adx_min': E3['adx_min'],
+        'seasonal_factor': None, 'size': None, 'adr_ratio': None,
+    }
     try:
         df_1w = descargar_datos(E3['ticker'], E3['periodo_data'], E3['intervalo'])
-        if not df_1w.empty:
-            df_1w = calcular_indicadores(df_1w)
-            adr   = obtener_adr(E3['ticker'])
+        if df_1w.empty:
+            sl_e3['reason'] = 'datos_vacios'
+        else:
+            df_1w  = calcular_indicadores(df_1w)
+            adr    = obtener_adr(E3['ticker'])
+            ultima = df_1w.iloc[-1]
+            close  = float(ultima['Close'])
+            bb_up  = float(ultima['bb_up'])
+            bb_mid = float(ultima['bb_mid'])
+            adx    = float(ultima['adx'])
+            factor = E3['sizing_estacional'].get(mes_actual, 1.0)
+
+            sl_e3.update({
+                'close': round(close, 3), 'bb_up': round(bb_up, 3),
+                'bb_mid': round(bb_mid, 3), 'adx': round(adx, 2),
+                'seasonal_factor': factor, 'adr_ratio': round(adr['ratio'], 3),
+            })
+
+            if factor == 0:
+                sl_e3['reason'] = 'factor_estacional_cero'
+            elif adx <= E3['adx_min']:
+                sl_e3['reason'] = f"adx_bajo ({adx:.1f} <= {E3['adx_min']})"
+            elif close <= bb_up:
+                sl_e3['reason'] = f"precio_fuera_bb (close={close:.3f} <= bb_up={bb_up:.3f})"
 
             if señal_e2_e3(df_1w, E3):
-                ultima = df_1w.iloc[-1]
-                factor = E3['sizing_estacional'].get(mes_actual, 1.0)
-                size   = calcular_size(adr['ratio'], factor)
-
+                size = calcular_size(adr['ratio'], factor)
+                sl_e3['size'] = size
                 if size > 0:
+                    sl_e3['signal'] = True
+                    sl_e3['reason'] = 'señal_detectada'
                     trail_cts = round(float(ultima['atr14']) * E3['trail_atr'], 2)
-                    sl_precio = round(float(ultima['Close']) - trail_cts, 3)
-
+                    sl_precio = round(close - trail_cts, 3)
+                    rec       = round(close - bb_mid, 2)
                     señal = save_signal(
-                        estrategia='E3', ticker=E3['ticker'],
-                        direccion='LONG',
-                        precio_entrada=float(ultima['Close']),
-                        bb_up=float(ultima['bb_up']),
-                        bb_mid=float(ultima['bb_mid']),
-                        adx=float(ultima['adx']),
-                        recorrido=round(float(ultima['Close']) - float(ultima['bb_mid']), 2),
-                        size=size,
-                        factor_estacional=factor,
-                        ratio_adr=adr['ratio'],
-                        sl=sl_precio,
+                        strategy='E3', ticker=E3['ticker'], direction='LONG',
+                        entry_price=close, bb_up=bb_up, bb_mid=bb_mid,
+                        adx=adx, range_cts=rec, size=size,
+                        seasonal_factor=factor, adr_ratio=adr['ratio'],
+                        sl_price=sl_precio,
                     )
-
                     if señal:
                         open_trade(
-                            señal_id=str(señal.get('id', 'paper')),
-                            estrategia='E3', ticker=E3['ticker'],
-                            direccion='LONG',
-                            entrada=float(ultima['Close']),
-                            sl=sl_precio,
-                            trail_cts=trail_cts,
-                            size=size,
+                            signal_id=str(señal.get('id', 'paper')),
+                            strategy='E3', ticker=E3['ticker'], direction='LONG',
+                            entry=close, sl=sl_precio,
+                            trail_cts=trail_cts, size=size,
                         )
-
                     alert_signal(
-                        estrategia=E3['nombre'],
-                        ticker=E3['ticker'], direccion='LONG',
-                        precio=float(ultima['Close']), sl=sl_precio,
-                        size=size, adx=float(ultima['adx']),
-                        recorrido=round(float(ultima['Close']) - float(ultima['bb_mid']), 2),
+                        estrategia=E3['nombre'], ticker=E3['ticker'],
+                        direccion='LONG', precio=close, sl=sl_precio,
+                        size=size, adx=adx, recorrido=rec,
                         factor_estacional=factor,
                     )
-                    señales_encontradas += 1
-                    logger.info(f"[E3] ✓ Señal LONG detectada @ {ultima['Close']:.2f}")
+                    señales_n += 1
+                    logger.info(f"[E3] ✓ Señal LONG detectada @ {close:.2f}")
                 else:
-                    logger.info(f"[E3] Factor estacional=0 (mes {mes_actual}) → omitida")
+                    sl_e3['reason'] = 'factor_estacional_cero'
+                    logger.info(f"[E3] Factor=0 (mes {mes_actual}) → omitida")
             else:
-                logger.info("[E3] Sin señal")
+                logger.info(f"[E3] Sin señal | motivo: {sl_e3['reason']}")
+
     except Exception as e:
+        sl_e3['reason'] = f"error: {e}"
+        errors.append(f"E3: {e}")
         logger.error(f"[E3] Error: {e}")
         alert_error(f"E3 error en señales: {e}")
 
-    logger.info(f"Señales encontradas hoy: {señales_encontradas}")
-    return señales_encontradas
+    strategy_logs.append(sl_e3)
+
+    logger.info(f"Señales encontradas hoy: {señales_n}")
+    return señales_n, strategy_logs, errors
 
 
 # ══════════════════════════════════════════════════════════
@@ -241,12 +309,6 @@ def buscar_señales():
 # ══════════════════════════════════════════════════════════
 
 def seguimiento_trades():
-    """
-    Para cada trade abierto:
-    - Actualiza el precio máximo y el trailing stop
-    - Cierra si se activa el stop o se supera el tiempo máximo
-    - Avisa si hay rollover próximo
-    """
     logger.info("=" * 50)
     logger.info("SEGUIMIENTO DE TRADES ABIERTOS...")
     logger.info("=" * 50)
@@ -254,7 +316,7 @@ def seguimiento_trades():
     trades = get_open_trades()
     if not trades:
         logger.info("Sin trades abiertos")
-        return
+        return 0
 
     logger.info(f"Trades abiertos: {len(trades)}")
 
@@ -268,81 +330,75 @@ def seguimiento_trades():
         barras     = trade['barras']
         trade_id   = str(trade['id'])
 
-        # Precio actual
         try:
             df = descargar_datos(ticker, '5d', '1d')
             if df.empty:
                 continue
-            precio_actual = float(df['Close'].iloc[-1])
+            precio_actual  = float(df['Close'].iloc[-1])
             precio_max_hoy = float(df['High'].iloc[-1])
             precio_min_hoy = float(df['Low'].iloc[-1])
         except Exception as e:
             logger.error(f"Error obteniendo precio para trade {trade_id}: {e}")
             continue
 
-        # Determinar config según estrategia
-        cfg = {'E1': E1, 'E2': E2, 'E3': E3}.get(estrategia, E1)
-        tick = cfg['tick']
+        cfg        = {'E1': E1, 'E2': E2, 'E3': E3}.get(estrategia, E1)
+        tick       = cfg['tick']
         max_barras = cfg['max_barras']
 
-        # Actualizar máximo precio y trailing stop
-        cerrado = False
-        motivo = None
+        cerrado       = False
+        motivo        = None
         precio_salida = precio_actual
-        res_cts = 0.0
+        res_cts       = 0.0
 
         if direccion == 'LONG':
-            nuevo_max = max(max_p, precio_max_hoy)
+            nuevo_max   = max(max_p, precio_max_hoy)
             nuevo_trail = nuevo_max - trail_cts
-            # ¿Se activó el trailing?
             if precio_min_hoy <= nuevo_trail:
                 precio_salida = nuevo_trail
-                res_cts = nuevo_trail - entrada
-                motivo = 'TRAIL'
-                cerrado = True
-            # ¿Tiempo máximo?
+                res_cts       = nuevo_trail - entrada
+                motivo        = 'TRAIL'
+                cerrado       = True
             elif barras + 1 >= max_barras:
                 precio_salida = precio_actual
-                res_cts = precio_actual - entrada
-                motivo = 'TIEMPO'
-                cerrado = True
+                res_cts       = precio_actual - entrada
+                motivo        = 'TIEMPO'
+                cerrado       = True
 
         elif direccion == 'SHORT':
-            # Para SHORT: max_precio es en realidad el mínimo alcanzado
-            nuevo_max = min(max_p, precio_min_hoy) if barras > 0 else max_p
+            nuevo_max   = min(max_p, precio_min_hoy) if barras > 0 else max_p
             nuevo_trail = nuevo_max + trail_cts
-            # ¿Se activó el stop?
             if precio_max_hoy >= nuevo_trail:
                 precio_salida = nuevo_trail
-                res_cts = entrada - nuevo_trail
-                motivo = 'SL' if res_cts < 0 else 'TRAIL'
-                cerrado = True
-            # ¿Llegó al TP (BB_mid)?
+                res_cts       = entrada - nuevo_trail
+                motivo        = 'SL' if res_cts < 0 else 'TRAIL'
+                cerrado       = True
             elif barras + 1 >= max_barras:
-                res_cts = entrada - precio_actual
-                motivo = 'TIEMPO'
-                cerrado = True
+                res_cts       = entrada - precio_actual
+                motivo        = 'TIEMPO'
+                cerrado       = True
                 precio_salida = precio_actual
 
         if cerrado:
             resultado_usd = round(res_cts * tick * trade['size'], 2)
             close_trade(trade_id, precio_salida, motivo, res_cts, resultado_usd)
             alert_close(estrategia, ticker, motivo, res_cts,
-                          resultado_usd, entrada, precio_salida)
+                        resultado_usd, entrada, precio_salida)
             logger.info(f"Trade {trade_id} cerrado: {motivo} | {resultado_usd:+.2f}$")
         else:
-            # Actualizar estado
-            update_trade(trade_id, nuevo_max, nuevo_max - trail_cts
-                              if direccion == 'LONG' else nuevo_max + trail_cts,
-                              barras + 1)
+            update_trade(
+                trade_id, nuevo_max,
+                nuevo_max - trail_cts if direccion == 'LONG' else nuevo_max + trail_cts,
+                barras + 1,
+            )
             logger.info(f"Trade {trade_id} actualizado: precio={precio_actual:.2f} | barras={barras+1}")
 
-        # Comprobar rollover
         roll_info = cerca_de_rollover(ticker)
         if roll_info['proximidad']:
             alert_rollover(ticker, roll_info['dias_restantes'],
-                            roll_info['fecha_venc'])
+                           roll_info['fecha_venc'])
             logger.warning(f"⚠️  ROLLOVER en {roll_info['dias_restantes']} días para {ticker}")
+
+    return len(trades)
 
 
 # ══════════════════════════════════════════════════════════
@@ -350,14 +406,22 @@ def seguimiento_trades():
 # ══════════════════════════════════════════════════════════
 
 def enviar_resumen():
-    """
-    Calcula y envía el resumen del paper trading.
-    """
     logger.info("=" * 50)
     logger.info("ENVIANDO RESUMEN DIARIO...")
     logger.info("=" * 50)
 
     resumen = get_summary()
+
+    # Mostrar métricas por estrategia en el log
+    if resumen.get('trades', 0) > 0:
+        logger.info(f"GLOBAL | trades={resumen['trades']} WR={resumen['wr']}% "
+                    f"PF={resumen['pf']} net={resumen['net']:+.2f}$")
+        for s, m in resumen.get('by_strategy', {}).items():
+            wr_s = round(m['wins'] / m['trades'] * 100, 1) if m['trades'] > 0 else 0
+            logger.info(f"  {s} | trades={m['trades']} WR={wr_s}% net={m['net']:+.2f}$")
+    else:
+        logger.info("Sin trades cerrados aún")
+
     alert_daily_summary(resumen)
     logger.info(f"Resumen: {resumen}")
 
@@ -368,27 +432,47 @@ def enviar_resumen():
 
 def main():
     parser = argparse.ArgumentParser(description='Bot de paper trading de granos')
-    parser.add_argument('--modo', choices=['señales', 'seguimiento', 'resumen', 'todo'],
-                        default='todo', help='Modo de ejecución')
+    parser.add_argument('--modo',
+                        choices=['señales', 'seguimiento', 'resumen', 'todo'],
+                        default='todo')
     args = parser.parse_args()
 
+    t0   = time.time()
     ahora = datetime.now(pytz.timezone(TZ_LOCAL))
     logger.info(f"Bot iniciado | Modo: {args.modo} | {ahora.strftime('%d/%m/%Y %H:%M')} (Madrid)")
 
+    strategy_logs = []
+    signals_n     = 0
+    open_trades_n = 0
+    errors        = []
+
     try:
         if args.modo in ('señales', 'todo'):
-            buscar_señales()
+            signals_n, strategy_logs, errors = buscar_señales()
 
         if args.modo in ('seguimiento', 'todo'):
-            seguimiento_trades()
+            open_trades_n = seguimiento_trades()
 
         if args.modo in ('resumen', 'todo'):
             enviar_resumen()
 
     except Exception as e:
         logger.error(f"Error crítico: {e}")
+        errors.append(str(e))
         alert_error(f"Error crítico en bot: {e}")
         sys.exit(1)
+
+    finally:
+        # Guardar log del ciclo siempre, incluso si hay error
+        duration = round(time.time() - t0, 2)
+        save_cycle_log(
+            mode=args.modo,
+            strategy_logs=strategy_logs,
+            signals_n=signals_n,
+            open_trades_n=open_trades_n,
+            errors=errors,
+            duration_s=duration,
+        )
 
     logger.info("Bot finalizado correctamente")
 
