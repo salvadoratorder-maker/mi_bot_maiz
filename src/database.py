@@ -1,6 +1,6 @@
 """
 database.py — Operaciones con Supabase (PostgreSQL)
-Tablas: signals, trades, bot_logs (sin tildes ni caracteres especiales)
+Tablas: signals, trades, bot_logs
 """
 
 import os
@@ -79,19 +79,19 @@ def open_trade(signal_id, strategy, ticker, direction,
                entry, sl, trail_cts, size) -> Optional[dict]:
     client = get_client()
     data = {
-        'signal_id':    signal_id,
-        'opened_at':    datetime.now(pytz.UTC).isoformat(),
-        'strategy':     strategy,
-        'ticker':       ticker,
-        'direction':    direction,
-        'entry_price':  round(entry, 3),
-        'sl_initial':   round(sl, 3),
-        'trail_cts':    round(trail_cts, 3),
-        'max_price':    round(entry, 3),
-        'trail_current':round(sl, 3),
-        'size':         size,
-        'bars':         0,
-        'status':       'OPEN',
+        'signal_id':     signal_id,
+        'opened_at':     datetime.now(pytz.UTC).isoformat(),
+        'strategy':      strategy,
+        'ticker':        ticker,
+        'direction':     direction,
+        'entry_price':   round(entry, 3),
+        'sl_initial':    round(sl, 3),
+        'trail_cts':     round(trail_cts, 3),
+        'max_price':     round(entry, 3),
+        'trail_current': round(sl, 3),
+        'size':          size,
+        'bars':          0,
+        'status':        'OPEN',
     }
     if client is None:
         logger.info(f"[NO DB] Trade opened: {strategy} {direction} {ticker} @ {entry}")
@@ -166,21 +166,115 @@ def get_summary() -> dict:
         trades = res.data or []
         if not trades:
             return {'trades': 0, 'message': 'No closed trades yet'}
-        wins  = [t for t in trades if t['result_usd'] > 0]
-        loss  = [t for t in trades if t['result_usd'] <= 0]
-        tg    = sum(t['result_usd'] for t in wins)
-        tp    = sum(abs(t['result_usd']) for t in loss)
-        neto  = round(tg - tp, 2)
+        wins = [t for t in trades if t['result_usd'] > 0]
+        loss = [t for t in trades if t['result_usd'] <= 0]
+        tg   = sum(t['result_usd'] for t in wins)
+        tp   = sum(abs(t['result_usd']) for t in loss)
+        neto = round(tg - tp, 2)
+
+        # Por estrategia
+        by_strategy = {}
+        for t in trades:
+            s = t['strategy']
+            if s not in by_strategy:
+                by_strategy[s] = {'trades': 0, 'wins': 0, 'net': 0.0}
+            by_strategy[s]['trades'] += 1
+            by_strategy[s]['net']    += t['result_usd']
+            if t['result_usd'] > 0:
+                by_strategy[s]['wins'] += 1
+
         return {
-            'trades':  len(trades),
-            'wins':    len(wins),
-            'losses':  len(loss),
-            'wr':      round(len(wins) / len(trades) * 100, 1),
-            'pf':      round(tg / tp, 2) if tp > 0 else 999,
-            'net':     neto,
-            'avg_win': round(tg / len(wins), 2) if wins else 0,
-            'avg_loss':round(-tp / len(loss), 2) if loss else 0,
+            'trades':      len(trades),
+            'wins':        len(wins),
+            'losses':      len(loss),
+            'wr':          round(len(wins) / len(trades) * 100, 1),
+            'pf':          round(tg / tp, 2) if tp > 0 else 999,
+            'net':         neto,
+            'avg_win':     round(tg / len(wins), 2) if wins else 0,
+            'avg_loss':    round(-tp / len(loss), 2) if loss else 0,
+            'by_strategy': by_strategy,
         }
     except Exception as e:
         logger.error(f"Error getting summary: {e}")
         return {}
+
+
+# ══════════════════════════════════════════════════════════
+# CYCLE LOG — observabilidad por ciclo
+# ══════════════════════════════════════════════════════════
+
+def save_cycle_log(mode: str, strategy_logs: list, signals_n: int,
+                   open_trades_n: int, errors: list = None,
+                   duration_s: float = 0.0) -> bool:
+    """
+    Guarda en bot_logs el detalle de un ciclo de ejecución.
+
+    strategy_logs: lista de dicts con el detalle de cada estrategia evaluada:
+        {
+          'strategy':        'E1',
+          'ticker':          'ZC=F',
+          'signal':          True/False,
+          'reason':          'sin_señal' | 'adx_bajo' | 'precio_fuera_bb' |
+                             'factor_estacional_cero' | 'datos_vacios' |
+                             'error' | 'señal_detectada',
+          'close':           float o None,
+          'bb_up':           float o None,
+          'bb_mid':          float o None,
+          'adx':             float o None,
+          'adx_min':         float o None,
+          'seasonal_factor': float o None,
+          'size':            float o None,
+          'adr_ratio':       float o None,
+          'hora':            int o None,    # solo E1
+          'horas_op':        list o None,   # solo E1
+        }
+    """
+    import json
+
+    client = get_client()
+    data = {
+        'created_at':    datetime.now(pytz.UTC).isoformat(),
+        'mode':          mode,
+        'signals_n':     signals_n,
+        'trades_n':      open_trades_n,
+        'errors':        json.dumps(errors or []),
+        'duration_s':    round(duration_s, 2),
+        # Detalle por estrategia serializado como JSON en el campo notas
+        # Usamos el campo 'errors' para errores y añadimos strategy_detail
+        # como texto en notes si el schema lo permite, o lo logueamos.
+    }
+
+    # Loguear siempre en consola para que GitHub Actions lo capture
+    logger.info("=" * 50)
+    logger.info(f"CYCLE LOG | modo={mode} señales={signals_n} trades_abiertos={open_trades_n}")
+    for sl in strategy_logs:
+        if sl['signal']:
+            logger.info(
+                f"  [{sl['strategy']}] ✓ SEÑAL | {sl['ticker']} "
+                f"close={sl.get('close')} bb_up={sl.get('bb_up')} "
+                f"adx={sl.get('adx'):.1f} size={sl.get('size')} "
+                f"factor={sl.get('seasonal_factor')}"
+            )
+        else:
+            logger.info(
+                f"  [{sl['strategy']}] ✗ SIN SEÑAL | motivo={sl['reason']} | "
+                f"close={sl.get('close')} bb_up={sl.get('bb_up')} "
+                f"adx={sl.get('adx')} adx_min={sl.get('adx_min')} "
+                f"factor={sl.get('seasonal_factor')} "
+                + (f"hora={sl.get('hora')} horas_op={sl.get('horas_op')}"
+                   if sl['strategy'] == 'E1' else "")
+            )
+    if errors:
+        for err in errors:
+            logger.warning(f"  ERROR: {err}")
+    logger.info("=" * 50)
+
+    # Guardar en Supabase
+    if client is None:
+        return True
+    try:
+        client.table('bot_logs').insert(data).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Error saving cycle log: {e}")
+        return False
