@@ -21,9 +21,10 @@ E1 = {
     'max_barras':   20,          # máximo barras hasta cierre forzado
     'horas_op':     list(range(18, 24)) + list(range(0, 8)),  # Chicago
     # Sizing estacional (factor × size base ADR)
+    # julio: cambiado 0.0 → 1.0 para observar comportamiento en paper trading
     'sizing_estacional': {
         1: 1.0, 2: 1.0, 3: 1.0, 4: 0.5,
-        5: 1.5, 6: 1.5, 7: 0.0, 8: 1.0,
+        5: 1.5, 6: 1.5, 7: 1.0, 8: 1.0,
         9: 0.5, 10: 1.0, 11: 1.5, 12: 0.5,
     },
 }
@@ -44,9 +45,10 @@ E2 = {
     'trail_atr':    0.5,         # trailing stop = 0.5 × ATR14
     'max_barras':   8,           # máximo semanas hasta cierre forzado
     # Sizing estacional
+    # julio: cambiado 0.0 → 1.0 para observar comportamiento en paper trading
     'sizing_estacional': {
         1: 1.5, 2: 1.0, 3: 1.0, 4: 1.5,
-        5: 0.5, 6: 0.5, 7: 0.0, 8: 1.0,
+        5: 0.5, 6: 0.5, 7: 1.0, 8: 1.0,
         9: 1.5, 10: 1.0, 11: 0.5, 12: 2.0,
     },
 }
@@ -67,9 +69,10 @@ E3 = {
     'trail_atr':    0.5,
     'max_barras':   8,
     # Sizing estacional
+    # julio: cambiado 0.0 → 1.0 para observar comportamiento en paper trading
     'sizing_estacional': {
         1: 1.5, 2: 1.5, 3: 1.0, 4: 1.5,
-        5: 0.5, 6: 1.0, 7: 0.0, 8: 0.0,
+        5: 0.5, 6: 1.0, 7: 1.0, 8: 0.0,
         9: 0.0, 10: 1.5, 11: 1.5, 12: 1.0,
     },
 }
@@ -91,7 +94,7 @@ RIESGO = {
 ROLLOVER = {
     'ZC=F': {  # Maíz: Mar(H), May(K), Jul(N), Sep(U), Dic(Z)
         'meses_vencimiento': [3, 5, 7, 9, 12],
-        'dias_antes_roll':   10,  # hacer roll 10 días antes del vencimiento
+        'dias_antes_roll':   10,
     },
     'ZS=F': {  # Soja: Ene(F), Mar(H), May(K), Jul(N), Ago(Q), Sep(U), Nov(X)
         'meses_vencimiento': [1, 3, 5, 7, 8, 9, 11],
