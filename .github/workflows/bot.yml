@@ -2,11 +2,9 @@ name: Grain Trading Bot
 
 on:
   schedule:
-    - cron: '0 0 * * 1-5'
-    - cron: '0 1 * * 1-5'
-    - cron: '0 2-8 * * 2-6'
-    - cron: '30 19 * * 5'
-    - cron: '0 20 * * 1-5'
+    - cron: '0 23 * * 0-4'    # 23:00 UTC dom-jue = 18:00 CT -> inicio ventana nocturna
+    - cron: '0 0-12 * * 1-5'  # 00:00 a 12:00 UTC lun-vie, cada hora = 19:00-07:00 CT -> resto de la ventana nocturna, sin huecos
+    - cron: '0 20 * * 1-5'    # 20:00 UTC lun-vie = 15:00 CT -> seguimiento / resumen por la tarde
   workflow_dispatch:
     inputs:
       modo:
