@@ -1,6 +1,6 @@
 """
 database.py — Operaciones con Supabase (PostgreSQL)
-Tablas: signals, trades, bot_logs
+Tablas: signals, trades, bot_logs, price_bars
 """
 
 import os
@@ -200,6 +200,67 @@ def get_summary() -> dict:
 
 
 # ══════════════════════════════════════════════════════════
+# PRICE BARS — historico propio acumulado con el tiempo
+# ══════════════════════════════════════════════════════════
+
+def save_price_bars(ticker: str, interval: str, df) -> int:
+    """
+    Guarda en price_bars todas las barras de un DataFrame OHLCV
+    (indice = timestamp de la barra). Usa upsert sobre
+    (ticker, interval, bar_time) para no duplicar si el bot
+    vuelve a descargar barras ya vistas.
+
+    Retorna el numero de barras que se intentaron guardar.
+    """
+    client = get_client()
+    if df is None or df.empty:
+        return 0
+
+    rows = []
+    for ts, row in df.iterrows():
+        try:
+            rows.append({
+                'ticker':       ticker,
+                'bar_interval': interval,
+                'bar_time':     ts.isoformat(),
+                'open':     round(float(row['Open']), 3),
+                'high':     round(float(row['High']), 3),
+                'low':      round(float(row['Low']), 3),
+                'close':    round(float(row['Close']), 3),
+                'volume':   int(row['Volume']) if not pd_isna(row.get('Volume')) else None,
+            })
+        except Exception as e:
+            logger.warning(f"Fila descartada al preparar price_bars: {e}")
+
+    if not rows:
+        return 0
+
+    if client is None:
+        logger.info(f"[NO DB] {len(rows)} barras de {ticker} {interval} listas (no guardadas, sin cliente)")
+        return len(rows)
+
+    try:
+        # upsert: si (ticker, interval, bar_time) ya existe, lo ignora/actualiza
+        # el flag on_conflict requiere el constraint UNIQUE creado en el SQL
+        client.table('price_bars').upsert(
+            rows, on_conflict='ticker,bar_interval,bar_time'
+        ).execute()
+        logger.info(f"price_bars: {len(rows)} barras de {ticker} {interval} guardadas/actualizadas")
+        return len(rows)
+    except Exception as e:
+        logger.error(f"Error guardando price_bars ({ticker} {interval}): {e}")
+        return 0
+
+
+def pd_isna(value) -> bool:
+    """Helper minimo para no importar pandas solo para esto."""
+    try:
+        return value is None or value != value  # NaN != NaN
+    except Exception:
+        return value is None
+
+
+# ══════════════════════════════════════════════════════════
 # CYCLE LOG — observabilidad por ciclo
 # ══════════════════════════════════════════════════════════
 
@@ -239,9 +300,6 @@ def save_cycle_log(mode: str, strategy_logs: list, signals_n: int,
         'trades_n':      open_trades_n,
         'errors':        json.dumps(errors or []),
         'duration_s':    round(duration_s, 2),
-        # Detalle por estrategia serializado como JSON en el campo notas
-        # Usamos el campo 'errors' para errores y añadimos strategy_detail
-        # como texto en notes si el schema lo permite, o lo logueamos.
     }
 
     # Loguear siempre en consola para que GitHub Actions lo capture
