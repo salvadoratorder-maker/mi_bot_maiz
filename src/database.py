@@ -294,12 +294,13 @@ def save_cycle_log(mode: str, strategy_logs: list, signals_n: int,
 
     client = get_client()
     data = {
-        'created_at':    datetime.now(pytz.UTC).isoformat(),
-        'mode':          mode,
-        'signals_n':     signals_n,
-        'trades_n':      open_trades_n,
-        'errors':        json.dumps(errors or []),
-        'duration_s':    round(duration_s, 2),
+        'created_at':      datetime.now(pytz.UTC).isoformat(),
+        'mode':            mode,
+        'signals_n':       signals_n,
+        'trades_n':        open_trades_n,
+        'errors':          json.dumps(errors or []),
+        'duration_s':      round(duration_s, 2),
+        'strategy_logs':   json.dumps(strategy_logs or []),
     }
 
     # Loguear siempre en consola para que GitHub Actions lo capture
