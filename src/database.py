@@ -276,4 +276,64 @@ def save_cycle_log(mode: str, strategy_logs: list, signals_n: int,
           'ticker':          'ZC=F',
           'signal':          True/False,
           'reason':          'sin_señal' | 'adx_bajo' | 'precio_fuera_bb' |
-                             'factor_estacional_cero' |
+                             'factor_estacional_cero' | 'datos_vacios' |
+                             'error' | 'señal_detectada',
+          'close':           float o None,
+          'bb_up':           float o None,
+          'bb_mid':          float o None,
+          'adx':             float o None,
+          'adx_min':         float o None,
+          'seasonal_factor': float o None,
+          'size':            float o None,
+          'adr_ratio':       float o None,
+          'hora':            int o None,    # solo E1
+          'horas_op':        list o None,   # solo E1
+        }
+    """
+    import json
+
+    client = get_client()
+    data = {
+        'created_at':      datetime.now(pytz.UTC).isoformat(),
+        'mode':            mode,
+        'signals_n':       signals_n,
+        'trades_n':        open_trades_n,
+        'errors':          errors or [],
+        'duration_s':      round(duration_s, 2),
+        'strategy_logs':   strategy_logs or [],
+    }
+
+    # Loguear siempre en consola para que GitHub Actions lo capture
+    logger.info("=" * 50)
+    logger.info(f"CYCLE LOG | modo={mode} señales={signals_n} trades_abiertos={open_trades_n}")
+    for sl in strategy_logs:
+        if sl['signal']:
+            logger.info(
+                f"  [{sl['strategy']}] ✓ SEÑAL | {sl['ticker']} "
+                f"close={sl.get('close')} bb_up={sl.get('bb_up')} "
+                f"adx={sl.get('adx'):.1f} size={sl.get('size')} "
+                f"factor={sl.get('seasonal_factor')}"
+            )
+        else:
+            logger.info(
+                f"  [{sl['strategy']}] ✗ SIN SEÑAL | motivo={sl['reason']} | "
+                f"close={sl.get('close')} bb_up={sl.get('bb_up')} "
+                f"adx={sl.get('adx')} adx_min={sl.get('adx_min')} "
+                f"factor={sl.get('seasonal_factor')} "
+                + (f"hora={sl.get('hora')} horas_op={sl.get('horas_op')}"
+                   if sl['strategy'] == 'E1' else "")
+            )
+    if errors:
+        for err in errors:
+            logger.warning(f"  ERROR: {err}")
+    logger.info("=" * 50)
+
+    # Guardar en Supabase
+    if client is None:
+        return True
+    try:
+        client.table('bot_logs').insert(data).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Error saving cycle log: {e}")
+        return False
